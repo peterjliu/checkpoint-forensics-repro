@@ -3,6 +3,8 @@ name = "checkpoint-forensics-repro"
 version = "0.1.0"
 description = "Independent reproduction of GPU-layout fingerprints in published model weights"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "numpy>=2.0",
     "scipy>=1.17.1",

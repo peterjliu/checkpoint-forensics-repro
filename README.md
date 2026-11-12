@@ -7,26 +7,87 @@ An independent reproduction of the core result in Will DePue's report
 Everything here runs on a CPU and uses only weights published on Hugging Face.
 No GPU is needed: the GPU random-number layout is emulated in numpy.
 
-## The idea
+## The concept
 
-PyTorch fills a large tensor on a GPU with `SMs x 2048` threads
-([`DistributionTemplates.h`](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/DistributionTemplates.h)).
-Thread `i` draws from Philox stream `i` of the seed and writes its k-th value
-to flat position `i + k * threads`.
+### 1. Weights start as seeded random numbers
+
+Before training, every weight is set to a random number. The numbers come from
+a pseudorandom generator (Philox, via NVIDIA's cuRAND), which is fully
+determined by a **seed**: same seed, same numbers, every time.
+
+### 2. The GPU decides where each number lands
+
+To fill billions of weights quickly, PyTorch splits the job across GPU threads.
+Each thread has its own stream of numbers from the seed, and the threads take
+turns across the tensor. Here is a toy GPU with 6 threads filling 18 weights.
+The letter is the thread, the digit is how many numbers it has drawn so far:
 
 ```
-threads = SMs * 2048          132 SMs -> 270,336   148 -> 303,104   152 -> 311,296
+6 threads:   A0 B0 C0 D0 E0 F0 | A1 B1 C1 D1 E1 F1 | A2 B2 C2 D2 E2 F2
+position:     0  1  2  3  4  5    6  7  8  9 10 11   12 13 14 15 16 17
+```
+
+Thread A's numbers land at positions 0, 6, 12. Now fill the same tensor with
+the same seed on a GPU with 5 threads:
+
+```
+5 threads:   A0 B0 C0 D0 E0 | A1 B1 C1 D1 E1 | A2 B2 C2 D2 E2 | A3 B3 C3
+position:     0  1  2  3  4    5  6  7  8  9   10 11 12 13 14   15 16 17
+```
+
+Thread A draws exactly the same numbers, but they now land at 0, 5, 10. Only
+the first pass (positions 0 to 4) agrees between the two; everything after is
+shuffled. The arrangement of the numbers records how many threads filled them.
+
+### 3. The thread count is set by the chip
+
+PyTorch does not pick the thread count; the hardware does. For a large fill it
+uses 2,048 threads per streaming multiprocessor (SM), the GPU's basic compute
+unit ([`calc_execution_policy` in `DistributionTemplates.h`](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/DistributionTemplates.h)):
+
+| SMs | Threads | Chips reported with this SM count |
+|---|---|---|
+| 108 | 221,184 | A100 / A800 |
+| 132 | 270,336 | H100 SXM / H800 / H200 (Hopper) |
+| 148 | 303,104 | B200 / B300 (Blackwell), per the report |
+| 152 | 311,296 | GB200 / GB300 (Blackwell), per the report |
+
+The exact rule, which `forensics/philox.py` implements:
+
+```
+threads = SMs * 2048
 
 position p  ->  thread = p % threads
-                k      = p // threads      (k-th value that thread drew)
+                k      = p // threads      (k-th number that thread drew)
                 value  = philox(seed, stream=thread, call=k // 4)[k % 4]
 ```
 
-So the same seed puts the same numbers in different places on chips with
-different SM counts. Embedding rows for tokens that never occur in training
-(for example the 13 bytes that cannot appear in valid UTF-8) receive no
-gradient and keep their starting values, so the layout can be read back from
-the released weights.
+### 4. Some weights are never trained
+
+Training normally overwrites the starting values. But a token embedding row
+only changes when its token appears in the training data, and some tokens never
+do. The clearest case is the 13 byte values that cannot occur in valid UTF-8
+(`0xC0`, `0xC1`, `0xF5` to `0xFF`): their rows receive no gradient and still
+hold their starting numbers in the released model. Reserved and unused special
+tokens behave the same way.
+
+### 5. Reading the fingerprint back
+
+Given a model's published embedding table:
+
+1. Find rows that look untouched (pure random noise, all with the same spread).
+2. For a candidate seed and SM count, regenerate what those positions would
+   have held, and compare with the published values.
+3. The right seed with the right SM count reproduces the rows almost exactly
+   (correlation above 0.99). The right seed with the wrong SM count, or the
+   wrong seed, gives no correlation at all.
+
+If the seed is unknown, try all 2^32 of them: a handful of untouched values is
+enough to single out one seed, because a wrong seed has no realistic chance of
+matching several values at once.
+
+The emulation is a few dozen lines of numpy and runs on a CPU, so the claim can
+be checked by anyone without access to the chips in question.
 
 ## Results
 
@@ -93,3 +154,7 @@ make blind    # recover seeds from the weights alone (about 10 min each on 14 co
 | `forensics/remote.py` | Read safetensors headers and single tensors over HTTP |
 | `forensics/scan.py` | Score candidate SM counts for a known seed |
 | `forensics/seed_search.py` | Search seeds, or generator offsets, from untouched values |
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
